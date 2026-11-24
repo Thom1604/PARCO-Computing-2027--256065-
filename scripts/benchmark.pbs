@@ -1,0 +1,124 @@
+#!/bin/bash
+# ======================== PBS DIRECTIVES =========================
+#PBS -N jacobi_heat_benchmark
+#PBS -l select=1:ncpus=16:mpiprocs=16:mem=16gb
+#PBS -l place=excl
+#PBS -l walltime=02:00:00
+#PBS -q shortCPUQ
+#PBS -o bench.out
+#PBS -e bench.err
+# =================================================================
+# ======================== INIZIALISATION =========================
+# =================================================================
+
+  # ======================== SYSTEM HW & LOG =========================
+    echo "======================== 2D HEAT EQUATION JACOBI STENCIL - BENCHMARK ========================="
+    echo "Date: $(date)"
+    echo "hostname: $(hostname)"
+    lscpu
+    numactl --hardware 2>/dev/null|| echo "numactl not available"
+    
+  # ======================== VERIFICATION =========================
+    set -e
+    cd "$PBS_O_WORKDIR"
+    [ -d "src" ] || cd ..
+    echo "Git Commit: $(git rev-parse HEAD 2>/dev/null || echo 'Not a git repository')"
+  
+    #I set the list of the required files
+    REQUIRED_FILES="include/heat.h src/serial.c src/openmp.c src/mpi.c"
+    for file in $REQUIRED_FILES; do
+      if [ ! -f $file ]; then 
+        MISSING_FILES="$MISSING_FILES $file"
+      fi
+    done
+    
+    if [ -n "$MISSING_FILES" ]; then 
+      echo "[!] Error -> Missing files: $MISSING_FILES">&2
+      exit 1;
+    fi
+    
+    mkdir -p bin results
+    
+    echo "All the necessary files are contained in the project" 
+    
+  # ======================== MODULES =========================
+    module purge
+    module load GCC/13.3.0
+    module load OpenMPI
+    
+  
+  # ======================== COMPILATORS =========================
+    CFLAGS="-O3 -march=native -Wall -Iinclude"
+    gcc $CFLAGS src/serial.c -o bin/jacobi_heat_serial -lm
+    gcc $CFLAGS -fopenmp src/openmp.c -o bin/jacobi_heat_omp -lm
+    mpicc $CFLAGS src/mpi.c -o bin/jacobi_heat_mpi -lm
+    
+    echo "gcc version: $(gcc --version | head -n 1)"
+    echo "CFLAGS: $CFLAGS"
+    
+    #======================== OPENMP ENVIRONMENT ========================= 
+      export OMP_PLACES=cores
+      export OMP_PROC_BIND=close
+      env | grep OMP_ || echo "No OMP_ variables set"
+
+# =============================================================
+# ======================== SIMULATION =========================
+# =============================================================
+  MAX_ITERS=10000
+  TOL=1e-6
+  WARMUP=15
+  REPS=30
+  OUT_CSV="results/benchmark_results.csv"
+  echo "version,scaling,grid_length,workers,run,status,max_diff,iters,time" > "$OUT_CSV"
+  
+  # Function of program running
+  run_benchmark(){
+    local version=$1
+    local scaling=$2
+    local grid_length=$3
+    local workers=$4
+    local cmd=$5
+    
+    $cmd | awk -v ver="$version" -v sc="$scaling" -v n="$grid_length" -v w="$workers" \
+    '/^Status:/ {
+      printf "%s,%s,%d,%d,%d,%s,%s,%s,%s\n", ver, sc, n, w, ++run, $2, $6, $9, $12;
+    }
+  ' >> "$OUT_CSV"
+  }
+  
+  #======================== STRONG SCALING =========================
+  for N in 512 1024 2048; do
+    #Serial execution
+    run_benchmark "serial" "strong" "$N" 1 "./bin/jacobi_heat_serial $N $MAX_ITERS $TOL $WARMUP $REPS"
+    
+    for P in 1 2 4 8 16; do
+      #OpenMP execution
+        run_benchmark "openmp" "strong" "$N" "$P" "./bin/jacobi_heat_omp $N $MAX_ITERS $TOL $WARMUP $REPS $P"
+      #MPI execution
+        run_benchmark "mpi" "strong" "$N" "$P" \
+        "mpirun --bind-to core -np $P ./bin/jacobi_heat_mpi $N $MAX_ITERS $TOL $WARMUP $REPS"
+    done  
+  done
+  
+  #======================== WEAK SCALING =========================
+  TOL=0
+  P_LIST=(1 2 4 9 16)
+  N_LIST=(512 724 1024 1536 2048)
+  
+  
+  for i in "${!P_LIST[@]}"; do
+    P=${P_LIST[$i]}
+    N=${N_LIST[$i]}
+    
+    #Serial execution
+    if [ "$P" -eq 1 ]; then 
+      run_benchmark "serial" "weak" "$N" 1 "./bin/jacobi_heat_serial $N $MAX_ITERS $TOL $WARMUP $REPS"
+    fi
+      
+    #OpenMP execution
+      run_benchmark "openmp" "weak" "$N" "$P" "./bin/jacobi_heat_omp $N $MAX_ITERS $TOL $WARMUP $REPS $P"
+    
+    #MPI execution
+      run_benchmark "mpi" "weak" "$N" "$P" \
+      "mpirun --bind-to core -np $P ./bin/jacobi_heat_mpi $N $MAX_ITERS $TOL $WARMUP $REPS"
+  done
